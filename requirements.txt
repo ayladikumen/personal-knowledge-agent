@@ -1,0 +1,7 @@
+python-telegram-bot==21.0.1
+google-generativeai==0.4.0
+beautifulsoup4==4.12.3
+requests==2.31.0
+yt-dlp==2024.3.10
+chromadb==0.4.24
+python-dotenv==1.0.1
