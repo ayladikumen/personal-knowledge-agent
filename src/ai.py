@@ -70,3 +70,58 @@ class AIEngine:
             "markdown_content": clean_text,
             "tags": tags
         }
+
+    def analyze_image(self, image_data: bytes) -> Dict[str, Any]:
+        """
+        Analyzes an image using Gemini Vision.
+        """
+        prompt = """
+        You are a personal knowledge assistant. Analyze this image.
+        Extract any text, describe what it is, and extract the core value so the user can find it useful later.
+        
+        Please provide your analysis in the following format (ensure it's clean Markdown):
+        
+        # [Title of the Content]
+        
+        ## Summary
+        [A brief 2-3 sentence summary of what this is]
+        
+        ## Why this is useful
+        [List 2-3 specific project ideas or situations where the user should come back to this resource]
+        
+        ## Image Contents
+        [Describe the image and any text found in it]
+        
+        At the very end of your response, on a new line, provide exactly 3 to 5 comma-separated tags relevant to this content, prefixed with TAGS:. For example:
+        TAGS: python, ui-design, inspiration
+        """
+        
+        image_part = {
+            "mime_type": "image/jpeg",
+            "data": image_data
+        }
+        
+        response = self.model.generate_content([prompt, image_part])
+        result_text = response.text
+        
+        # Parse tags
+        tags = []
+        clean_text = result_text
+        if "TAGS:" in result_text:
+            parts = result_text.split("TAGS:")
+            clean_text = parts[0].strip()
+            tags_part = parts[1].strip()
+            tags = [t.strip() for t in tags_part.split(",") if t.strip()]
+            
+        title = "Saved Image"
+        lines = clean_text.split('\n')
+        for line in lines:
+            if line.startswith("# "):
+                title = line.replace("# ", "").strip()
+                break
+                
+        return {
+            "title": title,
+            "markdown_content": clean_text,
+            "tags": tags
+        }

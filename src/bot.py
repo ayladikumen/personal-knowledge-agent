@@ -55,7 +55,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text:
         if update.message.photo:
-            await update.message.reply_text("Received a photo. Vision analysis is coming soon!")
+            status_msg = await update.message.reply_text("⏳ Processing your image...")
+            try:
+                photo_file = await update.message.photo[-1].get_file()
+                photo_bytes = await photo_file.download_as_bytearray()
+                
+                analysis = ai_engine.analyze_image(bytes(photo_bytes))
+                
+                filepath = storage.save_note(
+                    title=analysis['title'],
+                    content=analysis['markdown_content'],
+                    tags=analysis.get('tags')
+                )
+                
+                rag.add_note(
+                    filepath=filepath,
+                    title=analysis['title'],
+                    content=analysis['markdown_content'],
+                    tags=analysis.get('tags')
+                )
+                
+                success_msg = (
+                    f"✅ Image saved successfully!\n"
+                    f"Title: {analysis['title']}\n"
+                    f"Tags: {', '.join(analysis.get('tags', []))}\n"
+                    f"File: {os.path.basename(filepath)}"
+                )
+                await status_msg.edit_text(success_msg)
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Error processing image: {str(e)}")
         return
 
     status_msg = await update.message.reply_text("⏳ Processing your message...")
