@@ -1,112 +1,163 @@
 import re
-import requests
-from bs4 import BeautifulSoup
-# yt-dlp is powerful for extracting youtube info/transcripts easily if needed,
-# though for a lightweight script, fetching the webpage or using an API is an alternative.
-# We'll use a simple requests approach for general web pages and a basic youtube parser.
+from urllib.parse import urlsplit
 
+import requests
 import yt_dlp
+from bs4 import BeautifulSoup
+
+# Trailing punctuation is almost always sentence punctuation rather than part of
+# the link, so it is excluded from the final character class.
+URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\'.,;:!?)\]}]')
+
+REQUEST_TIMEOUT = 10
+MAX_EXTRACT_CHARS = 5000
+
 
 class ContentProcessor:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
         })
 
     def is_url(self, text: str) -> bool:
-        url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
-        return bool(url_pattern.search(text))
-        
+        return bool(URL_PATTERN.search(text or ""))
+
     def extract_url(self, text: str) -> str:
-        url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
-        match = url_pattern.search(text)
-        if match:
-            return match.group(0)
-        return None
+        match = URL_PATTERN.search(text or "")
+        return match.group(0) if match else None
 
     def process_message(self, text: str) -> dict:
         url = self.extract_url(text)
         if not url:
-            # It's just text
-            return {
-                "type": "text",
-                "content": text,
-                "url": None
-            }
-            
-        if "youtube.com" in url or "youtu.be" in url:
+            return {"type": "text", "content": text, "url": None}
+
+        # Match on the parsed host, not a substring of the whole URL, so a link
+        # like https://example.com/github.com/x isn't treated as a repo.
+        host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
+
+        if host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com"):
             return self._process_youtube(url)
-        elif "github.com" in url:
+        if host == "github.com":
             return self._process_github(url)
-        else:
-            return self._process_general_url(url)
+        return self._process_general_url(url)
 
     def _process_youtube(self, url: str) -> dict:
         try:
             ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'extract_flat': True # For speed, just get metadata if transcript isn't immediately available
+                "quiet": True,
+                "no_warnings": True,
+                # Metadata only — we never download the video itself.
+                "extract_flat": True,
+                "socket_timeout": REQUEST_TIMEOUT,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                title = info.get('title', 'Unknown YouTube Video')
-                description = info.get('description', '')
-                
-                content = f"Title: {title}\n\nDescription:\n{description}"
-                return {
-                    "type": "youtube",
-                    "content": content,
-                    "url": url
-                }
+
+            title = info.get("title", "Unknown YouTube Video")
+            description = info.get("description") or ""
+            channel = info.get("uploader") or info.get("channel") or ""
+
+            content = f"Title: {title}"
+            if channel:
+                content += f"\nChannel: {channel}"
+            content += f"\n\nDescription:\n{description[:MAX_EXTRACT_CHARS]}"
+
+            return {"type": "youtube", "content": content, "url": url}
         except Exception as e:
-            return {"type": "error", "content": f"Failed to extract YouTube info: {str(e)}", "url": url}
+            return {
+                "type": "error",
+                "content": f"Failed to extract YouTube info: {e}",
+                "url": url,
+            }
+
+    def _github_default_branch(self, owner: str, repo: str) -> str:
+        """Ask the GitHub API for the repo's default branch, falling back to main."""
+        try:
+            r = self.session.get(
+                f"https://api.github.com/repos/{owner}/{repo}",
+                timeout=REQUEST_TIMEOUT,
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            if r.status_code == 200:
+                return r.json().get("default_branch") or "main"
+        except requests.RequestException:
+            pass
+        return "main"
 
     def _process_github(self, url: str) -> dict:
-        # A simple way to process Github is to fetch the README
+        """Summarize a repo from its README, whatever the default branch is called."""
         try:
-            # Convert https://github.com/user/repo to https://raw.githubusercontent.com/user/repo/main/README.md
-            # This is a naive approach; it might fail if default branch is master
-            parts = url.replace("https://github.com/", "").split("/")
-            if len(parts) >= 2:
-                user, repo = parts[0], parts[1]
-                
-                # try main
-                raw_url = f"https://raw.githubusercontent.com/{user}/{repo}/main/README.md"
-                r = self.session.get(raw_url)
-                if r.status_code == 404:
-                    # try master
-                    raw_url = f"https://raw.githubusercontent.com/{user}/{repo}/master/README.md"
-                    r = self.session.get(raw_url)
-                
-                if r.status_code == 200:
-                    return {
-                        "type": "github",
-                        "content": f"Github Repo: {user}/{repo}\n\nREADME:\n{r.text[:5000]}", # truncate to avoid massive readmes
-                        "url": url
-                    }
-            
-            # Fallback to general scraping
+            parts = [p for p in urlsplit(url).path.strip("/").split("/") if p]
+            if len(parts) < 2:
+                return self._process_general_url(url)
+
+            owner, repo = parts[0], parts[1].removesuffix(".git")
+
+            branches = []
+            default_branch = self._github_default_branch(owner, repo)
+            for branch in (default_branch, "main", "master"):
+                if branch not in branches:
+                    branches.append(branch)
+
+            for branch in branches:
+                for name in ("README.md", "readme.md", "README.rst"):
+                    raw_url = (
+                        f"https://raw.githubusercontent.com/"
+                        f"{owner}/{repo}/{branch}/{name}"
+                    )
+                    r = self.session.get(raw_url, timeout=REQUEST_TIMEOUT)
+                    if r.status_code == 200:
+                        return {
+                            "type": "github",
+                            "content": (
+                                f"Github Repo: {owner}/{repo}\n\n"
+                                f"README:\n{r.text[:MAX_EXTRACT_CHARS]}"
+                            ),
+                            "url": url,
+                        }
+
+            # No README found (or a private repo) — fall back to scraping the page.
             return self._process_general_url(url)
         except Exception as e:
-            return {"type": "error", "content": f"Failed to extract Github info: {str(e)}", "url": url}
+            return {
+                "type": "error",
+                "content": f"Failed to extract Github info: {e}",
+                "url": url,
+            }
 
     def _process_general_url(self, url: str) -> dict:
         try:
-            r = self.session.get(url, timeout=10)
-            soup = BeautifulSoup(r.text, 'html.parser')
-            
-            title = soup.title.string if soup.title else "Unknown Page"
-            
-            # Extract paragraphs
-            paragraphs = soup.find_all('p')
-            text_content = "\n".join([p.get_text() for p in paragraphs])
-            
+            r = self.session.get(url, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            title = soup.title.get_text(strip=True) if soup.title else "Unknown Page"
+
+            # Scripts and styles leak minified JS into the summary otherwise.
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+
+            paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+            text_content = "\n".join(p for p in paragraphs if p)
+
+            # Some sites render body text without <p> tags at all.
+            if not text_content.strip():
+                text_content = soup.get_text("\n", strip=True)
+
             return {
                 "type": "url",
-                "content": f"Title: {title}\n\nContent:\n{text_content[:5000]}",
-                "url": url
+                "content": (
+                    f"Title: {title}\n\nContent:\n{text_content[:MAX_EXTRACT_CHARS]}"
+                ),
+                "url": url,
             }
         except Exception as e:
-            return {"type": "error", "content": f"Failed to extract webpage: {str(e)}", "url": url}
+            return {
+                "type": "error",
+                "content": f"Failed to extract webpage: {e}",
+                "url": url,
+            }

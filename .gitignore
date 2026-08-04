@@ -6,3 +6,4 @@ venv/
 vault/
 chroma_db/
 .telegram_offset
+.pytest_cache/
