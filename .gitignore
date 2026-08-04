@@ -4,6 +4,6 @@ __pycache__/
 venv/
 .venv/
 vault/
-chroma_db/
+data/
 .telegram_offset
 .pytest_cache/

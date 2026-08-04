@@ -3,7 +3,6 @@ google-genai>=1.0,<3
 beautifulsoup4>=4.12,<5
 requests>=2.31,<3
 yt-dlp>=2024.3.10
-chromadb>=0.4.24,<2
 python-dotenv>=1.0,<2
 # 1.x exposes FastMCP, 2.x renamed it to MCPServer; the server supports both.
 mcp[cli]>=1.2,<3

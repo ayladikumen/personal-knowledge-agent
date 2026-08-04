@@ -46,7 +46,7 @@ MAX_SYNC_BATCHES = 20
 processor = ContentProcessor()
 ai_engine = AIEngine(config.GEMINI_KEY)
 storage   = StorageManager(config.VAULT_PATH)
-rag       = RAGSearch(config.CHROMA_PATH)
+rag       = RAGSearch(config.DATA_PATH)
 
 # ── Telegram helpers ────────────────────────────────────────────────────────
 

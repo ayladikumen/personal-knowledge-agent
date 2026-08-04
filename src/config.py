@@ -26,7 +26,7 @@ def _path_from_env(var: str, default_name: str) -> str:
 
 
 VAULT_PATH  = _path_from_env("OBSIDIAN_VAULT_PATH", "vault")
-CHROMA_PATH = _path_from_env("CHROMA_DB_PATH", "chroma_db")
+DATA_PATH   = _path_from_env("DATA_PATH", "data")
 OFFSET_FILE = os.path.join(PROJECT_ROOT, ".telegram_offset")
 
 # ── Keys & models ───────────────────────────────────────────────────────────
