@@ -46,7 +46,7 @@ OFFSET_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
 processor  = ContentProcessor()
 ai_engine  = AIEngine(GEMINI_KEY)
 storage    = StorageManager(VAULT_PATH)
-rag        = RAGSearch(db_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "chroma_db"))
+rag        = RAGSearch(db_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data"))
 
 # ── Telegram helpers ────────────────────────────────────────────────────────
 
