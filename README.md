@@ -44,7 +44,7 @@ Only 6 lightweight packages. No bloated vector databases.
 
 | Package | Purpose |
 |---|---|
-| `google-generativeai` | Gemini AI (summaries, vision, embeddings) |
+| `google-genai` | Gemini AI (summaries, vision, embeddings) |
 | `beautifulsoup4` | Scrape text from web pages |
 | `requests` | HTTP calls (Telegram API, GitHub, URLs) |
 | `yt-dlp` | YouTube video metadata |
@@ -101,6 +101,17 @@ GEMINI_API_KEY=paste_your_gemini_key_here
 OBSIDIAN_VAULT_PATH=./vault
 ```
 
+Only the two keys are required. The rest have sensible defaults, and relative
+paths resolve from the project root:
+
+| Key | Required | Default | What it does |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | yes | — | Your bot, from @BotFather |
+| `GEMINI_API_KEY` | yes | — | Your key, from Google AI Studio |
+| `OBSIDIAN_VAULT_PATH` | no | `./vault` | Where notes are written |
+| `DATA_PATH` | no | `./data` | Where the embeddings index lives |
+| `GEMINI_MODEL` | no | `gemini-2.0-flash` | Any model your key can access |
+
 ### Step 4 — Connect to Your IDE
 
 Add the MCP server to your IDE config. The exact location depends on your tool:
@@ -122,6 +133,10 @@ Add this entry (update the path to match where you cloned the repo):
 }
 ```
 
+Use forward slashes on Windows too. If you installed into a virtualenv, point
+`command` at that env's Python (`.../venv/Scripts/python.exe` on Windows,
+`.../venv/bin/python` elsewhere) rather than a bare `python`.
+
 ### Step 5 — Start Using It
 
 1. **Save something**: Open Telegram on your phone → send a GitHub link, YouTube URL, image, or text to your bot.
@@ -137,3 +152,43 @@ That's it. No background services to manage.
 |---|---|
 | `sync_telegram` | Pulls all unread Telegram messages, processes them, saves to vault |
 | `search_knowledge_base` | Auto-syncs first, then searches your vault semantically |
+| `reindex_vault` | Rebuilds the embeddings index from the markdown notes on disk |
+
+If Telegram is unreachable, `search_knowledge_base` still searches what you
+already have rather than failing.
+
+---
+
+## Project layout
+
+| File | Role |
+|---|---|
+| `src/mcp_server.py` | Entry point — MCP tools and the Telegram sync loop |
+| `src/config.py` | Paths, keys and setup validation |
+| `src/processor.py` | Fetches and extracts content from links |
+| `src/ai.py` | Gemini summarization and vision, response parsing |
+| `src/storage.py` | Writes Obsidian markdown notes |
+| `src/rag.py` | Gemini embeddings, cosine similarity, JSON index |
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The tests stub out the network, Gemini and the embeddings store, so they run
+offline and need no API keys.
+
+## Troubleshooting
+
+**Search returns nothing but the vault has notes.** The index lives in
+`data/embeddings.json`, separate from the vault. If it was deleted, or the
+vault came from another machine, run `reindex_vault` to rebuild it.
+
+**"Missing configuration" from every tool.** The `.env` file must sit in the
+project root, next to `requirements.txt`. Placeholder values copied from
+`.env.example` count as unset.
+
+**Nothing syncs.** Only one process can poll a Telegram bot at a time. Make
+sure no other copy of the server is running against the same token.
