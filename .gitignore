@@ -5,3 +5,4 @@ venv/
 .venv/
 vault/
 chroma_db/
+.telegram_offset
