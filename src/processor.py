@@ -5,6 +5,8 @@ import requests
 import yt_dlp
 from bs4 import BeautifulSoup
 
+from transient import with_retries
+
 # Trailing punctuation is almost always sentence punctuation rather than part of
 # the link, so it is excluded from the final character class.
 URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\'.,;:!?)\]}]')
@@ -22,6 +24,24 @@ class ContentProcessor:
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
         })
+
+    def _get(self, url: str, **kwargs):
+        """
+        Fetch a URL, retrying briefly through a blip so a moment's flakiness
+        doesn't turn a saved link into a note that just says it failed.
+
+        A failure here still degrades to an error note rather than propagating:
+        a site that is down for good must not wedge the Telegram queue behind
+        it on every future sync.
+        """
+        def fetch():
+            response = self.session.get(url, **kwargs)
+            # Inside the retry so a 503 from the page is retried too, not just
+            # a connection that never landed.
+            response.raise_for_status()
+            return response
+
+        return with_retries(fetch)
 
     def is_url(self, text: str) -> bool:
         return bool(URL_PATTERN.search(text or ""))
@@ -76,6 +96,8 @@ class ContentProcessor:
 
     def _github_default_branch(self, owner: str, repo: str) -> str:
         """Ask the GitHub API for the repo's default branch, falling back to main."""
+        # Not retried: "main" is a perfectly good guess, so a slow retry here
+        # buys nothing the fallback doesn't already give us.
         try:
             r = self.session.get(
                 f"https://api.github.com/repos/{owner}/{repo}",
@@ -109,7 +131,13 @@ class ContentProcessor:
                         f"https://raw.githubusercontent.com/"
                         f"{owner}/{repo}/{branch}/{name}"
                     )
-                    r = self.session.get(raw_url, timeout=REQUEST_TIMEOUT)
+                    # Probing is expected to 404 its way down the list, so this
+                    # loop stays unretried; a network failure drops straight to
+                    # the fallback below, which does retry.
+                    try:
+                        r = self.session.get(raw_url, timeout=REQUEST_TIMEOUT)
+                    except requests.RequestException:
+                        break
                     if r.status_code == 200:
                         return {
                             "type": "github",
@@ -131,8 +159,7 @@ class ContentProcessor:
 
     def _process_general_url(self, url: str) -> dict:
         try:
-            r = self.session.get(url, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
+            r = self._get(url, timeout=REQUEST_TIMEOUT)
             soup = BeautifulSoup(r.text, "html.parser")
 
             title = soup.title.get_text(strip=True) if soup.title else "Unknown Page"

@@ -21,7 +21,23 @@ def test_relative_paths_resolve_against_project_root(monkeypatch):
     monkeypatch.setenv("SOME_PATH", "./notes")
 
     assert config._path_from_env("SOME_PATH", "unused") == os.path.join(
-        config.PROJECT_ROOT, "./notes"
+        config.PROJECT_ROOT, "notes"
+    )
+
+
+def test_resolved_paths_are_normalised(monkeypatch):
+    """The default './vault' should read as a plain path in user-facing messages."""
+    monkeypatch.setenv("SOME_PATH", "./vault")
+
+    assert "." not in os.path.basename(config._path_from_env("SOME_PATH", "unused"))
+    assert f"{os.sep}." not in config._path_from_env("SOME_PATH", "unused")
+
+
+def test_surrounding_whitespace_in_a_path_is_ignored(monkeypatch):
+    monkeypatch.setenv("SOME_PATH", "  ./notes  ")
+
+    assert config._path_from_env("SOME_PATH", "unused") == os.path.join(
+        config.PROJECT_ROOT, "notes"
     )
 
 

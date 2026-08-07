@@ -8,6 +8,7 @@ import math
 import os
 
 import config
+from transient import with_retries
 
 DB_FILENAME = "embeddings.json"
 EMBED_MODEL = "text-embedding-004"
@@ -59,9 +60,11 @@ class RAGSearch:
         from ai import AIEngine  # imported lazily to keep this module testable
 
         client = AIEngine().client
-        response = client.models.embed_content(
-            model=EMBED_MODEL,
-            contents=text[:MAX_EMBED_CHARS],
+        response = with_retries(
+            lambda: client.models.embed_content(
+                model=EMBED_MODEL,
+                contents=text[:MAX_EMBED_CHARS],
+            )
         )
         return list(response.embeddings[0].values)
 
