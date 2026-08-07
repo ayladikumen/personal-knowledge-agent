@@ -81,6 +81,24 @@ def test_empty_index_still_suggests_reindexing(configured, no_new_messages, monk
     assert "reindex_vault" in output
 
 
+def test_notes_left_behind_by_a_model_change_are_explained(
+    configured, no_new_messages, monkeypatch
+):
+    """
+    A vault full of notes that all return nothing is the confusing case: the
+    index is fine, it was just built by an embedding model that no longer
+    answers, so the reason has to be said out loud.
+    """
+    monkeypatch.setattr(mcp_server.rag, "search", lambda q, n_results=5: [])
+    monkeypatch.setattr(mcp_server.rag, "count", lambda: 2)
+    monkeypatch.setattr(mcp_server.rag, "skipped", 2)
+
+    output = mcp_server.search_knowledge_base("agents")
+
+    assert "different embedding model" in output
+    assert "reindex_vault" in output
+
+
 def test_results_are_returned_when_everything_works(configured, no_new_messages, monkeypatch):
     monkeypatch.setattr(mcp_server.rag, "search", lambda q, n_results=5: [{
         "title": "Agent Framework",

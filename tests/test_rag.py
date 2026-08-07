@@ -4,6 +4,7 @@ import json
 import os
 
 import pytest
+from google.genai import errors as genai_errors
 
 from rag import RAGSearch
 
@@ -123,3 +124,103 @@ def test_interrupted_save_leaves_no_partial_index(rag, tmp_path):
 
     # The atomic write should not leave its temp file behind.
     assert os.listdir(tmp_path / "data") == ["embeddings.json"]
+
+
+# ── Embedding models ────────────────────────────────────────────────────────
+
+
+def model_not_found(model):
+    return genai_errors.ClientError(
+        404, {"error": {"status": "NOT_FOUND", "message": f"{model} is not found"}}
+    )
+
+
+class FakeModels:
+    """Stands in for client.models, failing for every name but `working`."""
+
+    def __init__(self, working: str, failure=model_not_found):
+        self.working = working
+        self.failure = failure
+        self.asked = []
+
+    def embed_content(self, model, contents):
+        self.asked.append(model)
+        if model != self.working:
+            raise self.failure(model)
+        return type("Response", (), {
+            "embeddings": [type("E", (), {"values": [0.1, 0.2, 0.3]})()]
+        })()
+
+
+@pytest.fixture
+def live_rag(tmp_path, monkeypatch):
+    """A RAGSearch that goes through the real model-selection path."""
+    def build(working, failure=model_not_found):
+        rag = RAGSearch(db_path=str(tmp_path / "data"), model="text-embedding-004")
+        models = FakeModels(working, failure)
+        monkeypatch.setattr(
+            "ai.AIEngine.client",
+            property(lambda self: type("Client", (), {"models": models})()),
+        )
+        return rag, models
+
+    return build
+
+
+def test_a_retired_embedding_model_falls_through_to_one_that_exists(live_rag):
+    """
+    A retired model answers 404, not an outage — which is how every note ends
+    up failing to index while every other Gemini call still works.
+    """
+    rag, models = live_rag("gemini-embedding-001")
+
+    rag.add_note("/vault/a.md", "A", "some content")
+
+    assert models.asked == ["text-embedding-004", "gemini-embedding-001"]
+    assert rag.count() == 1
+
+
+def test_the_model_that_answered_is_remembered_for_the_rest_of_the_sync(live_rag):
+    rag, models = live_rag("gemini-embedding-001")
+
+    rag.add_note("/vault/a.md", "A", "one")
+    rag.add_note("/vault/b.md", "B", "two")
+
+    # Not four calls: the dead model is asked once, not once per note.
+    assert models.asked.count("text-embedding-004") == 1
+    assert rag.entries[-1]["model"] == "gemini-embedding-001"
+
+
+def test_a_bad_key_is_not_mistaken_for_a_retired_model(live_rag):
+    """Falling through on a 401 would hide the one error worth reporting."""
+    def unauthenticated(model):
+        return genai_errors.ClientError(401, {"error": {"status": "UNAUTHENTICATED"}})
+
+    rag, models = live_rag("nothing-works", failure=unauthenticated)
+
+    with pytest.raises(genai_errors.ClientError):
+        rag.add_note("/vault/a.md", "A", "content")
+
+    # Stopped at the first model rather than working down the list.
+    assert len(models.asked) == 1
+
+
+def test_notes_embedded_by_a_different_model_are_skipped_not_ranked(rag):
+    """
+    Vectors of different widths are not comparable. Scoring them anyway
+    truncates to the shorter one and ranks noise above real matches.
+    """
+    rag.add_note("/vault/current.md", "Agents", "agent agent")
+    rag.entries.append({
+        "filepath": "/vault/stale.md",
+        "title": "Stale",
+        "content": "agent agent agent",
+        "embedding": [0.5] * 768,  # indexed by a different model
+        "tags": [],
+        "url": "",
+    })
+
+    results = rag.search("agent")
+
+    assert [r["title"] for r in results] == ["Agents"]
+    assert rag.skipped == 1

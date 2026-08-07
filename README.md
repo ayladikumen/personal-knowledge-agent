@@ -30,7 +30,8 @@ Phone (Telegram) ──▶ Telegram Cloud (queues messages)
 ## Features
 
 - **Telegram Ingestion** — Share links / images / text from your phone
-- **GitHub** — Fetches and summarizes the README
+- **Link handling that doesn't drop saves** — See [Links](#links) below
+- **GitHub** — Repos (README, description, topics), issues, pull requests, single files and gists
 - **YouTube** — Extracts video metadata and description
 - **Images** — Gemini Vision analyzes screenshots and photos
 - **AI Summarization** — Every save is analyzed for *why it's useful to you in the future*
@@ -111,6 +112,9 @@ paths resolve from the project root:
 | `OBSIDIAN_VAULT_PATH` | no | `./vault` | Where notes are written |
 | `DATA_PATH` | no | `./data` | Where the embeddings index lives |
 | `GEMINI_MODEL` | no | `gemini-2.0-flash` | Any model your key can access |
+| `GEMINI_EMBED_MODEL` | no | `gemini-embedding-001` | The model used to embed notes for search |
+| `GITHUB_TOKEN` | no | — | Lifts the GitHub API rate limit on repo links |
+| `LINK_ARCHIVE_FALLBACK` | no | `true` | Read unreachable pages from the Internet Archive |
 
 ### Step 4 — Connect to Your IDE
 
@@ -168,12 +172,49 @@ picks up exactly where it left off.
 
 ---
 
+## Links
+
+A link you send from your phone is rarely a bare URL, and the page behind it is
+often not readable by a script. Both of those used to cost you the save.
+
+**Finding the link.** A URL is recognised in the middle of a sentence, wrapped
+in parentheses or markdown, bolded with asterisks, typed without a scheme
+(`example.com/x`, `www.example.com`), mistyped as `https:/example.com`, pasted
+with an invisible character on the end, or escaped as `&amp;`. Sentence
+punctuation is trimmed, but a bracket that is genuinely part of the URL is kept
+— `.../wiki/Python_(programming_language)` survives. Text that only looks like
+a domain (`main.py`, `README.md`, `node.js`, an email address) is left alone.
+
+A link **hidden behind link text**, and the URL from a shared post's preview,
+are read out of the Telegram message's entities — neither appears in the
+message body at all, so scanning the text alone found nothing to save.
+
+**Reading the page.** The chain is: the real page → the Internet Archive's copy
+→ the address itself. Along the way it prefers `<article>`/`<main>` over site
+furniture, falls back to OpenGraph metadata, decodes by the page's declared
+charset, reads plain text and JSON as-is, and describes PDFs and media rather
+than scraping them as gibberish. GitHub repos come from the API (README, any
+default branch, description, topics, stars) with raw-file probing as a backup;
+YouTube falls back to oEmbed when yt-dlp breaks.
+
+**When nothing works** — a paywall, a login wall, a 403, a dead domain — the
+note is still written from the URL itself plus whatever you typed alongside it.
+It is thinner than a scraped page, and it says so, but it is findable later.
+Nothing a link can do raises: a permanently dead URL must never wedge the
+Telegram queue behind it.
+
+If the message had more than one link, the first is read and the rest are
+recorded in the note.
+
+---
+
 ## Project layout
 
 | File | Role |
 |---|---|
 | `src/mcp_server.py` | Entry point — MCP tools and the Telegram sync loop |
 | `src/config.py` | Paths, keys and setup validation |
+| `src/links.py` | Finds and repairs the URLs in a message |
 | `src/processor.py` | Fetches and extracts content from links |
 | `src/ai.py` | Gemini summarization and vision, response parsing |
 | `src/storage.py` | Writes Obsidian markdown notes |
@@ -194,6 +235,20 @@ offline and need no API keys.
 **Search returns nothing but the vault has notes.** The index lives in
 `data/embeddings.json`, separate from the vault. If it was deleted, or the
 vault came from another machine, run `reindex_vault` to rebuild it.
+
+**Search returns nothing and mentions a different embedding model.** Google
+retires embedding models, and a retired one answers `404 NOT_FOUND` rather than
+anything that looks like an outage — so notes stop indexing while every other
+Gemini call keeps working. The configured model is tried first and the known
+alternatives after it, but vectors from two different models can't be compared,
+so older notes are skipped until `reindex_vault` rebuilds them with the model
+that answered.
+
+**A note is just the link and a line saying the page wasn't read.** The page
+refused to be read — a login wall, a paywall, a 403, or a domain that no longer
+resolves — and the Internet Archive had no copy either. The save is kept rather
+than dropped. Opening the link yourself and sending the interesting part as
+text gives the note something to work with.
 
 **"Missing configuration" from every tool.** The `.env` file must sit in the
 project root, next to `requirements.txt`. Placeholder values copied from

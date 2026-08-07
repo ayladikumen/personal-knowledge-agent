@@ -39,6 +39,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_KEY     = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 
+# Google retires embedding models on its own schedule, and an index built with
+# one is not comparable with an index built with another, so the name is
+# configurable and the model that actually answered is recorded per note.
+EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001").strip()
+
 # Values shipped in .env.example — present but useless, so treat them as unset.
 _PLACEHOLDERS = {
     "your_telegram_bot_token_here",
@@ -67,6 +72,25 @@ def has_telegram() -> bool:
 
 def has_gemini() -> bool:
     return is_configured(GEMINI_KEY)
+
+
+# ── Link handling ───────────────────────────────────────────────────────────
+
+
+def _flag(var: str, default: bool) -> bool:
+    value = (os.getenv(var) or "").strip().lower()
+    if not value:
+        return default
+    return value not in ("0", "false", "no", "off")
+
+
+# Unauthenticated GitHub API calls share a 60-per-hour budget with everyone
+# else on the same IP; a token is optional but makes repo links reliable.
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+
+# When a page can't be read — paywalled, gone, refusing scripted requests —
+# fall back to the Internet Archive's copy before giving up on its text.
+ARCHIVE_FALLBACK = _flag("LINK_ARCHIVE_FALLBACK", True)
 
 
 def setup_hint(keys: list[str]) -> str:

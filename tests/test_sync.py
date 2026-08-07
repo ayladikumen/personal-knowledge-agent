@@ -270,13 +270,24 @@ def test_largest_photo_size_is_downloaded(offset_file, monkeypatch):
     assert requested == ["large"]
 
 
+def stub_processor(monkeypatch):
+    """Record what the processor was asked to read, without any network."""
+    seen = []
+
+    def fake_process_message(text, extra_urls=None):
+        seen.append({"text": text, "extra_urls": extra_urls or []})
+        # Stands in for the real routing: a hidden link is the one to read
+        # when the visible text has none of its own.
+        url = extra_urls[0] if extra_urls else text
+        return {"type": "url", "content": f"scraped:{text}", "url": url}
+
+    monkeypatch.setattr(mcp_server.processor, "process_message", fake_process_message)
+    return seen
+
+
 def test_photo_caption_is_used_as_content(offset_file, saved, monkeypatch):
     """A link shared with media arrives as a caption, not text."""
-    monkeypatch.setattr(
-        mcp_server.processor,
-        "process_message",
-        lambda text: {"type": "url", "content": f"scraped:{text}", "url": text},
-    )
+    stub_processor(monkeypatch)
     stub_updates(monkeypatch, [[
         {"update_id": 7, "message": {"caption": "https://example.com/thing"}}
     ]])
@@ -284,6 +295,60 @@ def test_photo_caption_is_used_as_content(offset_file, saved, monkeypatch):
     mcp_server._sync()
 
     assert saved and saved[0]["url"] == "https://example.com/thing"
+
+
+def test_a_link_hidden_behind_link_text_is_passed_on(offset_file, saved, monkeypatch):
+    """
+    "read this" with the URL behind the words has no link in the message body.
+    Scanning the text alone finds nothing, and the save is silently dropped.
+    """
+    seen = stub_processor(monkeypatch)
+    stub_updates(monkeypatch, [[{
+        "update_id": 8,
+        "message": {
+            "text": "read this",
+            "entities": [{
+                "type": "text_link", "offset": 0, "length": 9,
+                "url": "https://example.com/hidden",
+            }],
+        },
+    }]])
+
+    mcp_server._sync()
+
+    assert seen[0]["extra_urls"] == ["https://example.com/hidden"]
+    assert saved and saved[0]["url"] == "https://example.com/hidden"
+
+
+def test_a_link_preview_url_is_passed_on(offset_file, saved, monkeypatch):
+    seen = stub_processor(monkeypatch)
+    stub_updates(monkeypatch, [[{
+        "update_id": 9,
+        "message": {
+            "caption": "",
+            "caption_entities": [],
+            "link_preview_options": {"url": "https://example.com/preview"},
+        },
+    }]])
+
+    mcp_server._sync()
+
+    assert seen[0]["extra_urls"] == ["https://example.com/preview"]
+
+
+def test_plain_entities_that_are_not_links_are_ignored(offset_file, monkeypatch):
+    seen = stub_processor(monkeypatch)
+    stub_updates(monkeypatch, [[{
+        "update_id": 10,
+        "message": {
+            "text": "some **bold** words",
+            "entities": [{"type": "bold", "offset": 5, "length": 4}],
+        },
+    }]])
+
+    mcp_server._sync()
+
+    assert seen[0]["extra_urls"] == []
 
 
 def test_non_message_updates_are_skipped(offset_file, saved, monkeypatch):
