@@ -137,6 +137,27 @@ def _save(analysis: dict, source_url: str = None) -> dict:
     }
 
 
+def _hidden_urls(message: dict) -> list[str]:
+    """
+    The links Telegram keeps outside the message text.
+
+    A forwarded post or a hyperlink typed as "read this" carries its URL in a
+    `text_link` entity, and a shared link's preview carries it in
+    `link_preview_options` — in both cases the body text has no URL in it at
+    all, and scanning the text alone finds nothing to save.
+    """
+    found = []
+    for key in ("entities", "caption_entities"):
+        for entity in message.get(key) or []:
+            if entity.get("type") == "text_link" and entity.get("url"):
+                found.append(entity["url"])
+
+    preview_url = (message.get("link_preview_options") or {}).get("url")
+    if preview_url:
+        found.append(preview_url)
+    return found
+
+
 def _handle_update(update: dict) -> dict | None:
     """Process a single Telegram update into a saved note, or None to skip."""
     message = update.get("message") or update.get("channel_post")
@@ -152,10 +173,11 @@ def _handle_update(update: dict) -> dict | None:
 
     # Captions carry the text when a link is shared alongside media.
     text = message.get("text") or message.get("caption") or ""
-    if not text.strip():
+    hidden = _hidden_urls(message)
+    if not text.strip() and not hidden:
         return None
 
-    raw_data = processor.process_message(text)
+    raw_data = processor.process_message(text, extra_urls=hidden)
     result = _process_and_save(raw_data["content"], raw_data.get("url"))
     result["type"] = raw_data["type"]
     return result
@@ -339,6 +361,13 @@ def search_knowledge_base(query: str) -> str:
             notices.append(
                 "The search index is empty. If your vault already has notes, "
                 "run reindex_vault to rebuild the index."
+            )
+        elif rag.skipped:
+            # Vectors from a retired embedding model can't be compared with
+            # today's, so they were skipped rather than ranked as noise.
+            notices.append(
+                f"{rag.skipped} note(s) were indexed with a different embedding "
+                "model and had to be skipped. Run reindex_vault to rebuild them."
             )
         return "\n".join(notices)
 
