@@ -32,6 +32,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as MCPServer
 
 import config
+import transient
 from ai import AIEngine
 from processor import ContentProcessor
 from rag import RAGSearch
@@ -111,13 +112,23 @@ def _save(analysis: dict, source_url: str = None) -> dict:
         tags=analysis.get("tags"),
     )
 
-    rag.add_note(
-        filepath=filepath,
-        title=analysis["title"],
-        content=analysis["markdown_content"],
-        url=source_url,
-        tags=analysis.get("tags"),
-    )
+    try:
+        rag.add_note(
+            filepath=filepath,
+            title=analysis["title"],
+            content=analysis["markdown_content"],
+            url=source_url,
+            tags=analysis.get("tags"),
+        )
+    except Exception as e:
+        # Indexing embeds the note, so it fails during a Gemini outage too. That
+        # leaves the message queued for a retry, and a note file already on disk
+        # would come back as a duplicate. Drop it; the retry rewrites it.
+        # A permanent failure keeps the file — the message is consumed, and
+        # reindex_vault can still pick the note up later.
+        if transient.is_transient(e) and os.path.exists(filepath):
+            os.remove(filepath)
+        raise
 
     return {
         "title": analysis["title"],
@@ -160,6 +171,7 @@ def _sync() -> list[dict]:
 
     results: list[dict] = []
     offset = _read_offset()
+    stalled = False
 
     for _ in range(MAX_SYNC_BATCHES):
         params = {"timeout": 0, "limit": 100}
@@ -169,7 +181,10 @@ def _sync() -> list[dict]:
         try:
             updates = _telegram_api("getUpdates", params).get("result", [])
         except Exception as e:
-            results.append({"error": f"Could not reach Telegram: {e}"})
+            results.append({
+                "error": f"Could not reach Telegram: {transient.describe(e)}",
+                "retryable": transient.is_transient(e),
+            })
             break
 
         if not updates:
@@ -181,6 +196,26 @@ def _sync() -> list[dict]:
                 if result:
                     results.append(result)
             except Exception as e:
+                if transient.is_transient(e):
+                    # Confirming this update_id would delete the message from
+                    # Telegram's queue, so a passing outage would destroy the
+                    # note instead of postponing it. Leave the offset where it
+                    # is and stop: Telegram redelivers this message, and every
+                    # message behind it, on the next sync.
+                    results.append({
+                        "error": (
+                            f"{transient.describe(e)}. Nothing was lost — this "
+                            "message and any after it are still queued in "
+                            "Telegram, and the next sync will pick them up."
+                        ),
+                        "update_id": update["update_id"],
+                        "retryable": True,
+                    })
+                    stalled = True
+                    break
+
+                # A permanent failure can't succeed on a retry, so confirm it
+                # anyway rather than let it block the queue forever.
                 results.append({"error": str(e), "update_id": update["update_id"]})
 
             # Persist after every message so a later crash can't replay the
@@ -188,7 +223,7 @@ def _sync() -> list[dict]:
             offset = max(offset, update["update_id"] + 1)
             _write_offset(offset)
 
-        if len(updates) < 100:
+        if stalled or len(updates) < 100:
             break
 
     return results
@@ -198,7 +233,14 @@ def _format_sync(results: list[dict]) -> str:
     saved  = [r for r in results if "error" not in r]
     errors = [r for r in results if "error" in r]
 
-    lines = [f"Synced {len(saved)} new item(s) into the knowledge base:"]
+    # "Synced 0 new item(s)" over a list of failures reads like a success.
+    if saved:
+        lines = [f"Synced {len(saved)} new item(s) into the knowledge base:"]
+    elif errors:
+        lines = ["Nothing was saved to the knowledge base."]
+    else:
+        lines = ["Synced 0 new item(s) into the knowledge base:"]
+
     for item in saved:
         tags = ", ".join(item.get("tags", []))
         lines.append(
@@ -210,6 +252,12 @@ def _format_sync(results: list[dict]) -> str:
         lines.append(f"\n{len(errors)} message(s) failed to process:")
         for err in errors:
             lines.append(f"  ✗ {err['error']}")
+
+        if any(err.get("retryable") for err in errors):
+            lines.append(
+                "\nThis is a temporary outage, not a lost save. Run "
+                "sync_telegram again in a minute to finish the queue."
+            )
 
     return "\n".join(lines)
 
@@ -268,13 +316,22 @@ def search_knowledge_base(query: str) -> str:
                 notices.append(
                     f"(Synced {new_count} new item(s) from Telegram before searching.)"
                 )
-            failed = len(synced) - new_count
-            if failed:
-                notices.append(f"({failed} incoming message(s) could not be processed.)")
+            # Report what actually broke rather than a bare count — a Gemini
+            # outage and an unreachable Telegram need different responses.
+            for err in (r for r in synced if "error" in r):
+                notices.append(f"(Sync issue: {err['error']})")
         except Exception as e:
-            notices.append(f"(Telegram sync skipped: {e})")
+            notices.append(f"(Sync skipped: {transient.describe(e)})")
 
-    results = rag.search(query, n_results=5)
+    try:
+        results = rag.search(query, n_results=5)
+    except Exception as e:
+        # Searching needs Gemini to embed the query, so it fails during the
+        # same outages the sync does.
+        notices.append(f"Could not search: {transient.describe(e)}.")
+        if transient.is_transient(e):
+            notices.append("Your saved notes are intact — try the search again shortly.")
+        return "\n".join(notices)
 
     if not results:
         notices.append(f"No results found for '{query}'.")
@@ -313,7 +370,7 @@ def reindex_vault() -> str:
     if not os.path.isdir(config.VAULT_PATH):
         return f"Vault directory not found: {config.VAULT_PATH}"
 
-    indexed, failed = 0, []
+    indexed, failed, outage = 0, [], None
     for entry in sorted(os.listdir(config.VAULT_PATH)):
         if not entry.endswith(".md"):
             continue
@@ -328,12 +385,22 @@ def reindex_vault() -> str:
             )
             indexed += 1
         except Exception as e:
+            if transient.is_transient(e):
+                # Every remaining note would hit the same outage; stop instead
+                # of grinding through the whole vault to fail on each one.
+                outage = transient.describe(e)
+                break
             failed.append(f"{entry}: {e}")
 
     summary = f"Reindexed {indexed} note(s) from {config.VAULT_PATH}."
     if failed:
         summary += f"\n{len(failed)} file(s) failed:\n" + "\n".join(
             f"  ✗ {f}" for f in failed
+        )
+    if outage:
+        summary += (
+            f"\nStopped early: {outage}. Notes already indexed are kept — "
+            "run reindex_vault again shortly to finish the rest."
         )
     return summary
 

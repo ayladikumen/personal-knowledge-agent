@@ -19,10 +19,14 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 def _path_from_env(var: str, default_name: str) -> str:
     """Resolve a path from the environment, relative to the project root."""
-    value = os.getenv(var)
+    value = (os.getenv(var) or "").strip()
     if not value:
         return os.path.join(PROJECT_ROOT, default_name)
-    return value if os.path.isabs(value) else os.path.join(PROJECT_ROOT, value)
+    if os.path.isabs(value):
+        return os.path.normpath(value)
+    # normpath so the default "./vault" doesn't surface to the user as
+    # "C:\...\personal-knowledge-agent\.\vault" in every message.
+    return os.path.normpath(os.path.join(PROJECT_ROOT, value))
 
 
 VAULT_PATH  = _path_from_env("OBSIDIAN_VAULT_PATH", "vault")

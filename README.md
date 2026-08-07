@@ -157,6 +157,15 @@ That's it. No background services to manage.
 If Telegram is unreachable, `search_knowledge_base` still searches what you
 already have rather than failing.
 
+### Outages never lose a save
+
+Both syncing and searching go through Gemini, whose free tier answers
+`503 UNAVAILABLE` whenever the model is briefly overloaded. Short blips are
+retried automatically. If one outlasts the retries, the sync stops and leaves
+the message **in the Telegram queue** — a message is only confirmed once its
+note is written and indexed, so running `sync_telegram` again after the outage
+picks up exactly where it left off.
+
 ---
 
 ## Project layout
@@ -192,3 +201,13 @@ project root, next to `requirements.txt`. Placeholder values copied from
 
 **Nothing syncs.** Only one process can poll a Telegram bot at a time. Make
 sure no other copy of the server is running against the same token.
+
+**"503 UNAVAILABLE" during a sync.** That is Gemini being briefly overloaded,
+not Telegram. Nothing was lost — the messages are still queued. Wait a minute
+and run `sync_telegram` again.
+
+**Sync says "up to date" but the vault is empty.** Telegram deletes a message
+from its queue once the server confirms it, and versions before the outage
+handling above confirmed messages even when saving them failed. Those messages
+are gone from Telegram and need to be sent to the bot again; from then on a
+failed save keeps its message queued.

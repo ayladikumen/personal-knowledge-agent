@@ -4,6 +4,7 @@ from google import genai
 from google.genai import types
 
 import config
+from transient import with_retries
 
 # How much source text to hand the model. Long READMEs and article dumps get
 # truncated here so a single huge page can't blow up the request.
@@ -92,9 +93,14 @@ class AIEngine:
         return self._client
 
     def _generate(self, contents) -> str:
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=contents,
+        # A 503 here means the model is momentarily overloaded, which is common
+        # on the free tier and clears in seconds — retry before giving up, or
+        # the message that triggered it is lost.
+        response = with_retries(
+            lambda: self.client.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+            )
         )
         text = getattr(response, "text", "") or ""
         if not text.strip():

@@ -1,9 +1,20 @@
 """Tests for the Telegram sync loop, with the network and AI stubbed out."""
 
+import os
+
 import pytest
+from google.genai import errors as genai_errors
 
 import config
 import mcp_server
+import transient
+
+
+def gemini_error(code, status, message="boom"):
+    """The error google-genai raises when the model is overloaded."""
+    return genai_errors.ServerError(
+        code, {"error": {"status": status, "message": message}}
+    )
 
 
 @pytest.fixture
@@ -80,7 +91,7 @@ def test_offset_is_persisted_before_a_later_message_fails(offset_file, monkeypat
     """A crash midway must not replay the messages already saved."""
     def flaky(content, url=None):
         if content == "boom":
-            raise RuntimeError("gemini exploded")
+            raise ValueError("malformed content")
         return {"title": "ok", "tags": [], "file": "ok.md"}
 
     monkeypatch.setattr(mcp_server, "_process_and_save", flaky)
@@ -90,6 +101,119 @@ def test_offset_is_persisted_before_a_later_message_fails(offset_file, monkeypat
 
     assert [r for r in results if "error" in r][0]["update_id"] == 2
     # Both updates are consumed — the failure is reported, not retried forever.
+    assert open(offset_file).read() == "3"
+
+
+def test_a_gemini_outage_does_not_consume_the_message(offset_file, monkeypatch):
+    """
+    Confirming an update_id deletes the message from Telegram's queue. A 503
+    from Gemini is over in seconds, so consuming the message would trade a
+    short wait for a permanently lost note.
+    """
+    def overloaded(content, url=None):
+        raise gemini_error(503, "UNAVAILABLE", "The model is overloaded.")
+
+    monkeypatch.setattr(mcp_server, "_process_and_save", overloaded)
+    stub_updates(monkeypatch, [[text_update(100, "a note worth keeping")]])
+
+    results = mcp_server._sync()
+
+    assert results[0]["retryable"] is True
+    # No offset written at all — Telegram redelivers this message next time.
+    assert not os.path.exists(offset_file)
+
+
+def test_messages_behind_an_outage_are_left_queued(offset_file, saved, monkeypatch):
+    """Stopping at the first outage keeps the backlog intact and in order."""
+    def overloaded(content, url=None):
+        raise gemini_error(503, "UNAVAILABLE")
+
+    monkeypatch.setattr(mcp_server, "_process_and_save", overloaded)
+    stub_updates(monkeypatch, [[
+        text_update(1, "first"), text_update(2, "second"), text_update(3, "third"),
+    ]])
+
+    results = mcp_server._sync()
+
+    # One report, not three — and nothing consumed.
+    assert len(results) == 1
+    assert saved == []
+    assert not os.path.exists(offset_file)
+
+
+def test_saves_before_an_outage_are_still_confirmed(offset_file, monkeypatch):
+    """An outage midway keeps its own message, but not the ones already saved."""
+    def flaky(content, url=None):
+        if content == "boom":
+            raise gemini_error(503, "UNAVAILABLE")
+        return {"title": "ok", "tags": [], "file": "ok.md"}
+
+    monkeypatch.setattr(mcp_server, "_process_and_save", flaky)
+    stub_updates(monkeypatch, [[text_update(1, "fine"), text_update(2, "boom")]])
+
+    mcp_server._sync()
+
+    # Update 1 is confirmed; update 2 is not, so the retry starts there.
+    assert open(offset_file).read() == "2"
+
+
+def test_the_outage_report_names_gemini_not_telegram(offset_file, monkeypatch):
+    def overloaded(content, url=None):
+        raise gemini_error(503, "UNAVAILABLE", "The model is overloaded.")
+
+    monkeypatch.setattr(mcp_server, "_process_and_save", overloaded)
+    stub_updates(monkeypatch, [[text_update(1, "hello")]])
+
+    report = mcp_server._format_sync(mcp_server._sync())
+
+    assert "Gemini" in report
+    assert "Nothing was lost" in report
+    assert "sync_telegram again" in report
+
+
+def test_a_retried_outage_that_clears_saves_the_message(offset_file, monkeypatch):
+    """
+    The retry inside AIEngine means a brief 503 never reaches the sync loop at
+    all — the save just takes a moment longer.
+    """
+    calls = []
+
+    class FlakyModels:
+        def generate_content(self, model, contents):
+            calls.append(contents)
+            if len(calls) < 3:
+                raise gemini_error(503, "UNAVAILABLE")
+            return type("Response", (), {"text": "# Recovered\n\nBody\n\nTAGS: a, b"})()
+
+    # Stub the Gemini client, not _generate, so the real retry logic runs.
+    monkeypatch.setattr(
+        mcp_server.ai_engine, "_client", type("Client", (), {"models": FlakyModels()})()
+    )
+    monkeypatch.setattr(mcp_server, "_save", lambda a, url=None: {
+        "title": a["title"], "tags": a["tags"], "file": "note.md"
+    })
+    monkeypatch.setattr(transient.time, "sleep", lambda _: None)
+    stub_updates(monkeypatch, [[text_update(1, "plain text note")]])
+
+    results = mcp_server._sync()
+
+    assert len(calls) == 3
+    assert results[0]["title"] == "Recovered"
+    assert open(offset_file).read() == "2"
+
+
+def test_permanent_failures_still_advance_the_offset(offset_file, monkeypatch):
+    """A message that can never succeed must not wedge the queue forever."""
+    def bad_key(content, url=None):
+        raise genai_errors.ClientError(401, {"error": {"status": "UNAUTHENTICATED"}})
+
+    monkeypatch.setattr(mcp_server, "_process_and_save", bad_key)
+    stub_updates(monkeypatch, [[text_update(1, "hello"), text_update(2, "world")]])
+
+    results = mcp_server._sync()
+
+    assert len(results) == 2
+    assert not any(r.get("retryable") for r in results)
     assert open(offset_file).read() == "3"
 
 
