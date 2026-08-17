@@ -11,7 +11,11 @@ import config
 from transient import with_retries
 
 DB_FILENAME = "embeddings.json"
-EMBED_MODEL = "text-embedding-004"
+# text-embedding-004 was shut down by Google on 2026-01-14; gemini-embedding-2
+# (GA since 2026-04-22) is the current replacement. Note: embeddings from
+# different models live in different vector spaces, so switching this
+# requires a full reindex_vault (existing embeddings.json entries are stale).
+EMBED_MODEL = "gemini-embedding-2"
 
 # Embedding inputs are capped by the model; notes get truncated to fit.
 MAX_EMBED_CHARS = 2048
