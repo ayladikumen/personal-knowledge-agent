@@ -31,12 +31,12 @@ def text_update(update_id, text):
 
 @pytest.fixture
 def saved(monkeypatch):
-    """Capture what would have been saved, skipping AI, disk and the vector DB."""
+    """Capture what would have been saved, skipping AI and the note store."""
     captured = []
 
-    def fake_process_and_save(content, url=None):
-        captured.append({"content": content, "url": url})
-        return {"title": f"Note {len(captured)}", "tags": [], "file": "note.md"}
+    def fake_process_and_save(content, url=None, source_type=None):
+        captured.append({"content": content, "url": url, "type": source_type})
+        return {"title": f"Note {len(captured)}", "tags": [], "id": len(captured)}
 
     monkeypatch.setattr(mcp_server, "_process_and_save", fake_process_and_save)
     return captured
@@ -89,10 +89,10 @@ def test_backlog_larger_than_one_batch_is_fully_drained(offset_file, saved, monk
 
 def test_offset_is_persisted_before_a_later_message_fails(offset_file, monkeypatch):
     """A crash midway must not replay the messages already saved."""
-    def flaky(content, url=None):
+    def flaky(content, url=None, source_type=None):
         if content == "boom":
             raise ValueError("malformed content")
-        return {"title": "ok", "tags": [], "file": "ok.md"}
+        return {"title": "ok", "tags": [], "id": 1}
 
     monkeypatch.setattr(mcp_server, "_process_and_save", flaky)
     stub_updates(monkeypatch, [[text_update(1, "fine"), text_update(2, "boom")]])
@@ -110,7 +110,7 @@ def test_a_gemini_outage_does_not_consume_the_message(offset_file, monkeypatch):
     from Gemini is over in seconds, so consuming the message would trade a
     short wait for a permanently lost note.
     """
-    def overloaded(content, url=None):
+    def overloaded(content, url=None, source_type=None):
         raise gemini_error(503, "UNAVAILABLE", "The model is overloaded.")
 
     monkeypatch.setattr(mcp_server, "_process_and_save", overloaded)
@@ -125,7 +125,7 @@ def test_a_gemini_outage_does_not_consume_the_message(offset_file, monkeypatch):
 
 def test_messages_behind_an_outage_are_left_queued(offset_file, saved, monkeypatch):
     """Stopping at the first outage keeps the backlog intact and in order."""
-    def overloaded(content, url=None):
+    def overloaded(content, url=None, source_type=None):
         raise gemini_error(503, "UNAVAILABLE")
 
     monkeypatch.setattr(mcp_server, "_process_and_save", overloaded)
@@ -143,10 +143,10 @@ def test_messages_behind_an_outage_are_left_queued(offset_file, saved, monkeypat
 
 def test_saves_before_an_outage_are_still_confirmed(offset_file, monkeypatch):
     """An outage midway keeps its own message, but not the ones already saved."""
-    def flaky(content, url=None):
+    def flaky(content, url=None, source_type=None):
         if content == "boom":
             raise gemini_error(503, "UNAVAILABLE")
-        return {"title": "ok", "tags": [], "file": "ok.md"}
+        return {"title": "ok", "tags": [], "id": 1}
 
     monkeypatch.setattr(mcp_server, "_process_and_save", flaky)
     stub_updates(monkeypatch, [[text_update(1, "fine"), text_update(2, "boom")]])
@@ -158,7 +158,7 @@ def test_saves_before_an_outage_are_still_confirmed(offset_file, monkeypatch):
 
 
 def test_the_outage_report_names_gemini_not_telegram(offset_file, monkeypatch):
-    def overloaded(content, url=None):
+    def overloaded(content, url=None, source_type=None):
         raise gemini_error(503, "UNAVAILABLE", "The model is overloaded.")
 
     monkeypatch.setattr(mcp_server, "_process_and_save", overloaded)
@@ -189,8 +189,8 @@ def test_a_retried_outage_that_clears_saves_the_message(offset_file, monkeypatch
     monkeypatch.setattr(
         mcp_server.ai_engine, "_client", type("Client", (), {"models": FlakyModels()})()
     )
-    monkeypatch.setattr(mcp_server, "_save", lambda a, url=None: {
-        "title": a["title"], "tags": a["tags"], "file": "note.md"
+    monkeypatch.setattr(mcp_server, "_save", lambda a, url=None, source_type=None: {
+        "title": a["title"], "tags": a["tags"], "id": 1
     })
     monkeypatch.setattr(transient.time, "sleep", lambda _: None)
     stub_updates(monkeypatch, [[text_update(1, "plain text note")]])
@@ -204,7 +204,7 @@ def test_a_retried_outage_that_clears_saves_the_message(offset_file, monkeypatch
 
 def test_permanent_failures_still_advance_the_offset(offset_file, monkeypatch):
     """A message that can never succeed must not wedge the queue forever."""
-    def bad_key(content, url=None):
+    def bad_key(content, url=None, source_type=None):
         raise genai_errors.ClientError(401, {"error": {"status": "UNAUTHENTICATED"}})
 
     monkeypatch.setattr(mcp_server, "_process_and_save", bad_key)
@@ -242,7 +242,7 @@ def test_photo_messages_are_routed_to_vision(offset_file, monkeypatch):
     monkeypatch.setattr(
         mcp_server,
         "_process_image_and_save",
-        lambda data: {"title": "An image", "tags": [], "file": "img.md"},
+        lambda data: {"title": "An image", "tags": [], "id": 1},
     )
     stub_updates(monkeypatch, [[
         {"update_id": 5, "message": {"photo": [{"file_id": "small"}, {"file_id": "large"}]}}
@@ -259,7 +259,7 @@ def test_largest_photo_size_is_downloaded(offset_file, monkeypatch):
         mcp_server, "_download_telegram_file", lambda fid: requested.append(fid) or b""
     )
     monkeypatch.setattr(
-        mcp_server, "_process_image_and_save", lambda d: {"title": "i", "tags": [], "file": "i"}
+        mcp_server, "_process_image_and_save", lambda d: {"title": "i", "tags": [], "id": 1}
     )
     stub_updates(monkeypatch, [[
         {"update_id": 5, "message": {"photo": [{"file_id": "small"}, {"file_id": "large"}]}}

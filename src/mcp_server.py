@@ -2,18 +2,26 @@
 Personal Knowledge Base — MCP Server
 
 This is the single entry point for the entire project.
-It exposes three tools to your AI coding assistant via MCP:
+It exposes five tools to your AI coding assistant via MCP:
 
   1. sync_telegram   — Pulls all unread Telegram messages, processes them
                        (GitHub, YouTube, images, text), summarizes with Gemini,
-                       and saves them as Obsidian markdown notes.
+                       and saves them into the notes database.
 
-  2. search_knowledge_base — Semantically searches your vault for past saves.
+  2. search_knowledge_base — Searches past saves by keyword and by meaning.
                              Automatically syncs Telegram first so you never
                              miss anything.
 
-  3. reindex_vault   — Rebuilds the search index from the markdown notes on
-                       disk, for when the vector database is lost or moved.
+  3. reindex_notes   — Re-embeds notes that have no usable vector, for after an
+                       outage or a change of embedding model.
+
+  4. export_markdown — Writes the database back out as Obsidian-style .md
+                       files, for browsing or handing to another tool.
+
+  5. import_markdown — Loads an existing markdown vault into the database.
+
+Notes live in a single SQLite file (data/notes.db) holding the text, tags, and
+embeddings together. Markdown is an import/export format, not the store.
 
 No background bot needed. The MCP server only runs while your IDE is open.
 """
@@ -32,11 +40,11 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as MCPServer
 
 import config
+import markdown_io
 import transient
 from ai import AIEngine
+from notes_db import NotesDB
 from processor import ContentProcessor
-from rag import RAGSearch
-from storage import StorageManager
 
 # Telegram caps getUpdates at 100 per call, so a large backlog needs several
 # rounds. This bounds a single sync so one call can't run forever.
@@ -46,8 +54,7 @@ MAX_SYNC_BATCHES = 20
 
 processor = ContentProcessor()
 ai_engine = AIEngine(config.GEMINI_KEY)
-storage   = StorageManager(config.VAULT_PATH)
-rag       = RAGSearch(config.DATA_PATH)
+notes     = NotesDB(config.DATA_PATH)
 
 # ── Telegram helpers ────────────────────────────────────────────────────────
 
@@ -92,48 +99,42 @@ def _download_telegram_file(file_id: str) -> bytes:
     return r.content
 
 
-def _process_and_save(content_text: str, source_url: str = None) -> dict:
-    """Run AI analysis, save to vault, index in vector DB."""
+def _process_and_save(
+    content_text: str, source_url: str = None, source_type: str = None
+) -> dict:
+    """Run AI analysis and store the result."""
     analysis = ai_engine.analyze_content(content_text, source_url)
-    return _save(analysis, source_url)
+    return _save(analysis, source_url, source_type)
 
 
 def _process_image_and_save(image_bytes: bytes) -> dict:
-    """Run Vision AI on an image, save to vault, index in vector DB."""
+    """Run Vision AI on an image and store the result."""
     analysis = ai_engine.analyze_image(image_bytes)
-    return _save(analysis, None)
+    return _save(analysis, None, "image")
 
 
-def _save(analysis: dict, source_url: str = None) -> dict:
-    filepath = storage.save_note(
+def _save(analysis: dict, source_url: str = None, source_type: str = None) -> dict:
+    """
+    Store one analysed item as a note.
+
+    The note and its embedding are written in a single transaction, so an
+    embedding outage can't leave a half-saved note behind for the Telegram
+    retry to duplicate. NotesDB.add_note owns that decision — see the comments
+    there for why a transient failure rolls back and a permanent one doesn't.
+    """
+    note_id = notes.add_note(
         title=analysis["title"],
         content=analysis["markdown_content"],
-        original_url=source_url,
+        url=source_url,
         tags=analysis.get("tags"),
+        source_type=source_type,
     )
-
-    try:
-        rag.add_note(
-            filepath=filepath,
-            title=analysis["title"],
-            content=analysis["markdown_content"],
-            url=source_url,
-            tags=analysis.get("tags"),
-        )
-    except Exception as e:
-        # Indexing embeds the note, so it fails during a Gemini outage too. That
-        # leaves the message queued for a retry, and a note file already on disk
-        # would come back as a duplicate. Drop it; the retry rewrites it.
-        # A permanent failure keeps the file — the message is consumed, and
-        # reindex_vault can still pick the note up later.
-        if transient.is_transient(e) and os.path.exists(filepath):
-            os.remove(filepath)
-        raise
 
     return {
         "title": analysis["title"],
         "tags": analysis.get("tags", []),
-        "file": os.path.basename(filepath),
+        "id": note_id,
+        "type": source_type,
     }
 
 
@@ -156,14 +157,16 @@ def _handle_update(update: dict) -> dict | None:
         return None
 
     raw_data = processor.process_message(text)
-    result = _process_and_save(raw_data["content"], raw_data.get("url"))
+    result = _process_and_save(
+        raw_data["content"], raw_data.get("url"), raw_data["type"]
+    )
     result["type"] = raw_data["type"]
     return result
 
 
 def _sync() -> list[dict]:
     """
-    Pull all unread Telegram messages, process them, and save to vault.
+    Pull all unread Telegram messages, process them, and store them.
     Returns a list of results (one per processed message).
     """
     if not config.has_telegram():
@@ -244,8 +247,8 @@ def _format_sync(results: list[dict]) -> str:
     for item in saved:
         tags = ", ".join(item.get("tags", []))
         lines.append(
-            f"  • [{item['type']}] {item['title']}  —  tags: {tags}  "
-            f"—  file: {item['file']}"
+            f"  • [{item.get('type')}] {item['title']}  —  tags: {tags}  "
+            f"—  note #{item.get('id')}"
         )
 
     if errors:
@@ -272,7 +275,7 @@ def sync_telegram() -> str:
     """
     Pull all unread messages from the user's Telegram bot, process them
     (GitHub repos, YouTube videos, images, general links, plain text),
-    summarize each with AI, and save them as Obsidian notes.
+    summarize each with AI, and save them to the knowledge base.
 
     Call this when the user starts a work session or asks you to check
     for new saves.
@@ -291,11 +294,13 @@ def sync_telegram() -> str:
 @mcp.tool()
 def search_knowledge_base(query: str) -> str:
     """
-    Search the user's personal knowledge base (Obsidian vault) for previously
-    saved tools, repos, videos, images, or ideas.
+    Search the user's personal knowledge base for previously saved tools,
+    repos, videos, images, or ideas.
 
-    Automatically syncs any new Telegram messages before searching so results
-    are always fresh.
+    Matches on keywords always, and on meaning as well whenever the embedding
+    API is reachable — so a result set still comes back during an outage, just
+    ranked less well. Automatically syncs any new Telegram messages first so
+    results are fresh.
 
     Use this whenever the user asks about a tool they saved, when you want to
     recommend a resource from their collection, or when building a project that
@@ -324,83 +329,175 @@ def search_knowledge_base(query: str) -> str:
             notices.append(f"(Sync skipped: {transient.describe(e)})")
 
     try:
-        results = rag.search(query, n_results=5)
+        outcome = notes.search(query, n_results=5)
     except Exception as e:
-        # Searching needs Gemini to embed the query, so it fails during the
-        # same outages the sync does.
+        # Keyword search is local, so reaching here means the database itself
+        # is unreadable — not something waiting a minute will fix.
         notices.append(f"Could not search: {transient.describe(e)}.")
-        if transient.is_transient(e):
-            notices.append("Your saved notes are intact — try the search again shortly.")
         return "\n".join(notices)
 
-    if not results:
+    if outcome.degraded:
+        tail = (
+            " Run the search again shortly for the full ranking."
+            if outcome.degraded_retryable
+            else ""
+        )
+        notices.append(
+            f"(Semantic search unavailable: {outcome.degraded}. Your notes are "
+            f"intact and keyword matches are shown below.{tail})"
+        )
+
+    unreachable = notes.unembedded_count()
+    if unreachable:
+        notices.append(
+            f"({unreachable} note(s) have no usable embedding — saved during an "
+            "outage, or indexed by an older model — so they are only reachable "
+            "by keyword. Run reindex_notes to rebuild them.)"
+        )
+
+    if not outcome.results:
         notices.append(f"No results found for '{query}'.")
-        if rag.count() == 0:
+        if notes.count() == 0:
             notices.append(
-                "The search index is empty. If your vault already has notes, "
-                "run reindex_vault to rebuild the index."
+                "The knowledge base is empty. If you have a markdown vault from "
+                "an earlier version, run import_markdown to load it."
             )
         return "\n".join(notices)
 
-    lines = notices + [f"Found {len(results)} result(s) for '{query}':\n"]
-    for idx, res in enumerate(results, 1):
+    lines = notices + [f"Found {len(outcome.results)} result(s) for '{query}':\n"]
+    for idx, res in enumerate(outcome.results, 1):
         lines.append(f"--- Result {idx} ---")
         lines.append(f"Title: {res['title']}")
         if res.get("url"):
             lines.append(f"Source: {res['url']}")
         if res.get("tags"):
             lines.append(f"Tags: {', '.join(res['tags'])}")
+        matched = ", ".join(res["matched_by"])
+        if res.get("similarity") is not None:
+            # Vector search ranks every note, so a low similarity is the only
+            # signal that a result is a near-miss rather than a real match.
+            matched += f" (similarity {res['similarity']:.2f})"
+        lines.append(f"Matched by: {matched}")
         lines.append(f"Snippet: {res['content_snippet']}")
-        lines.append(f"File: {res['filepath']}")
+        lines.append(f"Note: #{res['id']}  (saved {res['created_at']})")
         lines.append("")
 
     return "\n".join(lines)
 
 
 @mcp.tool()
-def reindex_vault() -> str:
+def reindex_notes(force: bool = False) -> str:
     """
-    Rebuild the semantic search index from the markdown notes in the Obsidian
-    vault.
+    Rebuild embeddings for notes that don't have a usable one.
 
-    Use this when search returns nothing even though notes exist — for example
-    after the vector database was deleted, or the vault was moved or synced
-    from another machine.
+    Use this after an embedding outage, or after changing GEMINI_EMBED_MODEL —
+    vectors from two different models aren't comparable, so notes indexed by
+    the old one drop out of semantic search until they're rebuilt.
+
+    Args:
+        force: Re-embed every note, not just the ones missing a vector.
     """
-    if not os.path.isdir(config.VAULT_PATH):
-        return f"Vault directory not found: {config.VAULT_PATH}"
+    if notes.count() == 0:
+        return (
+            "There are no notes to index yet. Run sync_telegram to pull saves "
+            "from Telegram, or import_markdown to load an existing vault."
+        )
 
-    indexed, failed, outage = 0, [], None
-    for entry in sorted(os.listdir(config.VAULT_PATH)):
-        if not entry.endswith(".md"):
-            continue
-        filepath = os.path.join(config.VAULT_PATH, entry)
+    report = notes.reindex(force=force)
+
+    if report["pending"] == 0:
+        return (
+            f"All {notes.count()} note(s) are already indexed with "
+            f"{notes.embed_model}. Nothing to do."
+        )
+
+    summary = (
+        f"Embedded {report['embedded']} of {report['pending']} note(s) with "
+        f"{notes.embed_model}."
+    )
+    if report["failed"]:
+        summary += f"\n{len(report['failed'])} note(s) failed:\n" + "\n".join(
+            f"  ✗ {failure}" for failure in report["failed"]
+        )
+    if report["outage"]:
+        summary += (
+            f"\nStopped early: {report['outage']}. Notes already embedded are "
+            "kept — run reindex_notes again shortly to finish the rest."
+        )
+    return summary
+
+
+@mcp.tool()
+def export_markdown(destination: str = "") -> str:
+    """
+    Write every note out as an Obsidian-style markdown file with frontmatter.
+
+    The database stays the source of truth; this is for reading the collection
+    in Obsidian, backing it up, or handing it to another tool.
+
+    Args:
+        destination: Directory to write into. Defaults to OBSIDIAN_VAULT_PATH.
+    """
+    dest = destination.strip() or config.VAULT_PATH
+
+    all_notes = notes.all_notes()
+    if not all_notes:
+        return "There are no notes to export yet."
+
+    written = markdown_io.MarkdownExporter(dest).export(all_notes)
+    return f"Exported {len(written)} note(s) to {dest}."
+
+
+@mcp.tool()
+def import_markdown(source: str = "") -> str:
+    """
+    Load an existing markdown vault into the notes database.
+
+    Each file's frontmatter supplies the title, source URL, tags and original
+    date where present. Re-importing the same vault updates the existing notes
+    rather than duplicating them, so it is safe to run twice.
+
+    Args:
+        source: Directory to read .md files from. Defaults to
+                OBSIDIAN_VAULT_PATH.
+    """
+    src = source.strip() or config.VAULT_PATH
+
+    if not os.path.isdir(src):
+        return f"Directory not found: {src}"
+
+    parsed = markdown_io.read_vault(src)
+    if not parsed:
+        return f"No .md files found in {src}."
+
+    imported, failed, outage = 0, [], None
+    for note in parsed:
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
-            rag.add_note(
-                filepath=filepath,
-                title=os.path.splitext(entry)[0],
-                content=content,
+            notes.add_note(
+                title=note["title"],
+                content=note["content"],
+                url=note["url"],
+                tags=note["tags"],
+                source_type=note["source_type"] or "markdown-import",
+                created_at=note["created_at"],
             )
-            indexed += 1
+            imported += 1
         except Exception as e:
             if transient.is_transient(e):
-                # Every remaining note would hit the same outage; stop instead
-                # of grinding through the whole vault to fail on each one.
+                # Every remaining note would hit the same outage.
                 outage = transient.describe(e)
                 break
-            failed.append(f"{entry}: {e}")
+            failed.append(f"{note['source_file']}: {e}")
 
-    summary = f"Reindexed {indexed} note(s) from {config.VAULT_PATH}."
+    summary = f"Imported {imported} of {len(parsed)} note(s) from {src}."
     if failed:
         summary += f"\n{len(failed)} file(s) failed:\n" + "\n".join(
-            f"  ✗ {f}" for f in failed
+            f"  ✗ {failure}" for failure in failed
         )
     if outage:
         summary += (
-            f"\nStopped early: {outage}. Notes already indexed are kept — "
-            "run reindex_vault again shortly to finish the rest."
+            f"\nStopped early: {outage}. Notes already imported are kept — run "
+            "import_markdown again shortly to finish the rest."
         )
     return summary
 

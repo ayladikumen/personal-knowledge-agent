@@ -29,6 +29,8 @@ def _path_from_env(var: str, default_name: str) -> str:
     return os.path.normpath(os.path.join(PROJECT_ROOT, value))
 
 
+# Notes are stored in DATA_PATH/notes.db. VAULT_PATH is only the markdown
+# import/export directory now — nothing reads or writes it during normal use.
 VAULT_PATH  = _path_from_env("OBSIDIAN_VAULT_PATH", "vault")
 DATA_PATH   = _path_from_env("DATA_PATH", "data")
 OFFSET_FILE = os.path.join(PROJECT_ROOT, ".telegram_offset")
@@ -38,6 +40,11 @@ OFFSET_FILE = os.path.join(PROJECT_ROOT, ".telegram_offset")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_KEY     = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+
+# Switching this invalidates every stored vector — embeddings from two models
+# aren't comparable — so notes_db records the model alongside each one and
+# reindex_notes re-embeds whatever no longer matches.
+GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-2").strip()
 
 # Values shipped in .env.example — present but useless, so treat them as unset.
 _PLACEHOLDERS = {

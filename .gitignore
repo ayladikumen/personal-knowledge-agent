@@ -7,3 +7,6 @@ vault/
 data/
 .telegram_offset
 .pytest_cache/
+
+# Output written by verify.bat and the tools/ scripts.
+*-log.txt

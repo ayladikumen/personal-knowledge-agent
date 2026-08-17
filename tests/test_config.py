@@ -42,11 +42,13 @@ def test_surrounding_whitespace_in_a_path_is_ignored(monkeypatch):
 
 
 def test_absolute_paths_are_left_alone(monkeypatch):
-    monkeypatch.setenv("SOME_PATH", os.path.join(os.sep, "srv", "vault"))
+    # A leading-separator path is merely drive-relative on Windows, and
+    # normpath anchors it to the current drive — so the path has to be fully
+    # qualified per platform for "left alone" to mean anything.
+    absolute = "C:\\srv\\vault" if os.name == "nt" else "/srv/vault"
+    monkeypatch.setenv("SOME_PATH", absolute)
 
-    assert config._path_from_env("SOME_PATH", "unused") == os.path.join(
-        os.sep, "srv", "vault"
-    )
+    assert config._path_from_env("SOME_PATH", "unused") == absolute
 
 
 def test_unset_path_falls_back_to_project_default(monkeypatch):
